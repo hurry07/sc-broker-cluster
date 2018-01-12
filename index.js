@@ -9,7 +9,9 @@ var scErrors = require('sc-errors');
 var BrokerError = scErrors.BrokerError;
 var ProcessExitError = scErrors.ProcessExitError;
 
-
+// --------------------------
+// AbstractDataClient
+// --------------------------
 var AbstractDataClient = function (dataClient) {
   this._dataClient = dataClient;
 };
@@ -100,7 +102,16 @@ AbstractDataClient.prototype.exec = function () {
   this._dataClient.exec(arguments[0], options, callback);
 };
 
-
+// --------------------------
+// SCExchange
+// --------------------------
+/**
+ *
+ * @param privateClientCluster
+ * @param publicClientCluster
+ * @param {Client|EventEmitter} ioClusterClient
+ * @constructor
+ */
 var SCExchange = function (privateClientCluster, publicClientCluster, ioClusterClient) {
   AbstractDataClient.call(this, publicClientCluster);
 
@@ -108,10 +119,11 @@ var SCExchange = function (privateClientCluster, publicClientCluster, ioClusterC
   this._publicClientCluster = publicClientCluster;
   this._ioClusterClient = ioClusterClient;
   this._channelEmitter = new EventEmitter();
-  this._channels = {};
+  this._channels = {}; // 已经注册的通道 string<->SCChannel
 
   this._messageHander = this._handleChannelMessage.bind(this);
 
+  // 子线程发来的消息在 exchange 处理
   this._ioClusterClient.on('message', this._messageHander);
 };
 
@@ -155,12 +167,17 @@ SCExchange.prototype._triggerChannelUnsubscribe = function (channel, newState) {
   } else {
     channel.state = channel.UNSUBSCRIBED;
   }
-  if (oldState == channel.SUBSCRIBED) {
+  if (oldState === channel.SUBSCRIBED) {
     channel.emit('unsubscribe', channelName);
     EventEmitter.prototype.emit.call(this, 'unsubscribe', channelName);
   }
 };
-
+/**
+ * 发送数据到对应 cluster.
+ * @param data
+ * @param mapIndex
+ * @param callback
+ */
 SCExchange.prototype.send = function (data, mapIndex, callback) {
   if (mapIndex == null) {
     // Send to all brokers in cluster if mapIndex is not provided
@@ -177,13 +194,18 @@ SCExchange.prototype.send = function (data, mapIndex, callback) {
       });
     })(targetClients[i]);
   }
+
   async.parallel(tasks, callback);
 };
 
 SCExchange.prototype.publish = function (channelName, data, callback) {
   this._ioClusterClient.publish(channelName, data, callback);
 };
-
+/**
+ *
+ * @param {string} channelName
+ * @return {*}
+ */
 SCExchange.prototype.subscribe = function (channelName) {
   var self = this;
 
@@ -194,7 +216,7 @@ SCExchange.prototype.subscribe = function (channelName) {
     this._channels[channelName] = channel;
   }
 
-  if (channel.state == channel.UNSUBSCRIBED) {
+  if (channel.state === channel.UNSUBSCRIBED) {
     channel.state = channel.PENDING;
     this._ioClusterClient.subscribe(channelName, function (err) {
       if (err) {
@@ -211,7 +233,7 @@ SCExchange.prototype.unsubscribe = function (channelName) {
   var channel = this._channels[channelName];
 
   if (channel) {
-    if (channel.state != channel.UNSUBSCRIBED) {
+    if (channel.state !== channel.UNSUBSCRIBED) {
 
       this._triggerChannelUnsubscribe(channel);
 
@@ -249,10 +271,10 @@ SCExchange.prototype.subscriptions = function (includePending) {
       channel = this._channels[channelName];
 
       if (includePending) {
-        includeChannel = channel && (channel.state == channel.SUBSCRIBED ||
-          channel.state == channel.PENDING);
+        includeChannel = channel && (channel.state === channel.SUBSCRIBED ||
+          channel.state === channel.PENDING);
       } else {
-        includeChannel = channel && channel.state == channel.SUBSCRIBED;
+        includeChannel = channel && channel.state === channel.SUBSCRIBED;
       }
 
       if (includeChannel) {
@@ -266,10 +288,9 @@ SCExchange.prototype.subscriptions = function (includePending) {
 SCExchange.prototype.isSubscribed = function (channelName, includePending) {
   var channel = this._channels[channelName];
   if (includePending) {
-    return !!channel && (channel.state == channel.SUBSCRIBED ||
-      channel.state == channel.PENDING);
+    return !!channel && (channel.state === channel.SUBSCRIBED || channel.state === channel.PENDING);
   }
-  return !!channel && channel.state == channel.SUBSCRIBED;
+  return !!channel && channel.state === channel.SUBSCRIBED;
 };
 
 SCExchange.prototype.watch = function (channelName, handler) {
@@ -300,7 +321,12 @@ SCExchange.prototype.map = function () {
   return this._publicClientCluster.map.apply(this._publicClientCluster, arguments);
 };
 
-
+// --------------------------
+// Server
+// --------------------------
+/**
+ * 所有 broker.js 的主线程
+ */
 var Server = module.exports.Server = function (options) {
   var self = this;
 
@@ -318,6 +344,7 @@ var Server = module.exports.Server = function (options) {
     self.emit('brokerStart', brokerInfo);
   };
 
+  // 多线程加载 broker.js
   for (var i = 0; i < len; i++) {
     var launchServer = function (i) {
       var socketPath = options.brokers[i];
@@ -331,7 +358,7 @@ var Server = module.exports.Server = function (options) {
         secretKey: options.secretKey,
         expiryAccuracy: options.expiryAccuracy,
         downgradeToUser: options.downgradeToUser,
-        brokerControllerPath: options.appBrokerControllerPath,
+        brokerControllerPath: options.appBrokerControllerPath, // broker.js
         processTermTimeout: options.processTermTimeout,
         ipcAckTimeout: options.ipcAckTimeout,
         brokerOptions: options.brokerOptions
@@ -339,6 +366,7 @@ var Server = module.exports.Server = function (options) {
 
       self._dataServers[i] = dataServer;
 
+      // 所有客户端都 ready 后 emit ready
       if (firstTime) {
         dataServer.on('ready', function (brokerInfo) {
           if (++readyCount >= options.brokers.length) {
@@ -365,6 +393,7 @@ var Server = module.exports.Server = function (options) {
         self.emit('error', err);
       });
 
+      // 退出重新启动
       dataServer.on('exit', function (brokerInfo) {
         var err = new ProcessExitError('Broker server at socket path ' + socketPath + ' exited');
         err.pid = process.pid;
@@ -377,6 +406,7 @@ var Server = module.exports.Server = function (options) {
           signal: brokerInfo.signal
         });
 
+        // 如果当前 server 没有停止
         if (!self._shuttingDown) {
           launchServer(i);
         }
@@ -392,7 +422,12 @@ var Server = module.exports.Server = function (options) {
 };
 
 Server.prototype = Object.create(EventEmitter.prototype);
-
+/**
+ * 向某个子线程发送消息
+ * @param brokerId
+ * @param data
+ * @param callback
+ */
 Server.prototype.sendToBroker = function (brokerId, data, callback) {
   var targetBroker = this._dataServers[brokerId];
   if (targetBroker) {
@@ -418,7 +453,12 @@ Server.prototype.destroy = function () {
   this.killBrokers();
 };
 
-
+// --------------------------
+// Client
+// --------------------------
+/**
+ * 连接所有 broker.js 线程提供的 tcp 服务
+ */
 var Client = module.exports.Client = function (options) {
   var self = this;
 
@@ -431,6 +471,7 @@ var Client = module.exports.Client = function (options) {
   for (var i in options.brokers) {
     if (options.brokers.hasOwnProperty(i)) {
       var socketPath = options.brokers[i];
+
       dataClient = scBroker.createClient({
         socketPath: socketPath,
         secretKey: options.secretKey,
@@ -452,18 +493,28 @@ var Client = module.exports.Client = function (options) {
     isSubscribed: true
   };
 
+  /**
+   * 依赖这个函数决定某个请求由哪个 clientid 来执行
+   * @param key       访问当前方法所需要数据 key
+   * @param method    方法名
+   * @param clientIds clientIds 列表
+   * @return {*}
+   * @private
+   */
   this._defaultMapper = function (key, method, clientIds) {
+    // 如果是 publish/subscribe/unsubscribe/isSubscribed
     if (channelMethods[method]) {
       if (key == null) {
         return clientIds;
       }
       return hasher(key);
-    } else if (method == 'query' || method == 'exec' || method == 'send') {
+
+    } else if (method === 'query' || method === 'exec' || method === 'send') {
       var mapIndex = key.mapIndex;
       if (mapIndex) {
         // A mapIndex of * means that the action should be sent to all
         // brokers in the cluster.
-        if (mapIndex == '*') {
+        if (mapIndex === '*') {
           return clientIds;
         } else {
           if (mapIndex instanceof Array) {
@@ -479,9 +530,11 @@ var Client = module.exports.Client = function (options) {
         }
       }
       return 0;
-    } else if (method == 'removeAll') {
+
+    } else if (method === 'removeAll') {
       return clientIds;
     }
+
     return hasher(key);
   };
 
@@ -530,6 +583,9 @@ var Client = module.exports.Client = function (options) {
     }
   }
 
+  /**
+   * private 通道上的有消息后同步
+   */
   this._privateClientCluster.on('message', this._handleExchangeMessage.bind(this));
 };
 
@@ -540,7 +596,7 @@ Client.prototype.destroy = function (callback) {
 };
 
 Client.prototype.on = function (event, listener) {
-  if (event == 'ready' && this._ready) {
+  if (event === 'ready' && this._ready) {
     listener();
   } else {
     EventEmitter.prototype.on.apply(this, arguments);
@@ -566,11 +622,20 @@ Client.prototype._dropUnusedSubscriptions = function (channel, callback) {
   }
   callback && callback();
 };
-
+/**
+ * 直接向所有 client 广播
+ * @param channelName
+ * @param data
+ * @param callback
+ */
 Client.prototype.publish = function (channelName, data, callback) {
   this._privateClientCluster.publish(channelName, data, callback);
 };
-
+/**
+ * 订阅
+ * @param channel
+ * @param callback
+ */
 Client.prototype.subscribe = function (channel, callback) {
   var self = this;
 
@@ -609,6 +674,7 @@ Client.prototype.unsubscribeAll = function (callback) {
       })(channel);
     }
   }
+
   async.parallel(tasks, callback);
 };
 
@@ -618,7 +684,12 @@ Client.prototype.isSubscribed = function (channel, includePending) {
   }
   return this._exchangeSubscriptions[channel] === true;
 };
-
+/**
+ * 记录订阅同 socket 之间的联系
+ * @param socket
+ * @param channel
+ * @param callback
+ */
 Client.prototype.subscribeSocket = function (socket, channel, callback) {
   var self = this;
 
@@ -636,7 +707,12 @@ Client.prototype.subscribeSocket = function (socket, channel, callback) {
 
   this._privateClientCluster.subscribe(channel, addSubscription);
 };
-
+/**
+ * 解开 socket 同订阅之间的联系
+ * @param socket
+ * @param channel
+ * @param callback
+ */
 Client.prototype.unsubscribeSocket = function (socket, channel, callback) {
   var self = this;
 
@@ -657,13 +733,20 @@ Client.prototype.unsubscribeSocket = function (socket, channel, callback) {
 Client.prototype.setSCServer = function (scServer) {
   this.scServer = scServer;
 };
-
+/**
+ * 在 cluster 任意一个线程上操作, 广播到全局?
+ * @param channel
+ * @param message
+ * @param options
+ * @private
+ */
 Client.prototype._handleExchangeMessage = function (channel, message, options) {
   var packet = {
     channel: channel,
     data: message
   };
 
+  // 通知远程服务器?
   var emitOptions = {};
   if (this.scServer) {
     // Optimization
